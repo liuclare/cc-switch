@@ -12,8 +12,48 @@ use crate::proxy::{
     },
 };
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+const TOKEN_BUDGET_OPEN: &str = "<total_tokens>";
+const TOKEN_BUDGET_CLOSE: &str = "</total_tokens>";
+
+/// Drop Claude Code's per-turn token budget lines from system text.
+///
+/// Claude Code appends one `<total_tokens>N tokens left</total_tokens>` line to
+/// `system` on every turn. Block-level caches tolerate that, but a prefix cache
+/// cannot: the conversation renders after `system`, so each append shifts every
+/// later token and the whole request is re-prefilled. Measured against a local
+/// llama.cpp endpoint, this took prompt processing from 26.9k tokens per turn
+/// down to a few hundred. Same class of defect as #2350.
+///
+/// Only lines that are exactly one budget tag are removed, so prompt text that
+/// merely mentions the tag survives.
+pub(crate) fn strip_claude_code_token_budget(text: &str) -> Cow<'_, str> {
+    if !text.contains(TOKEN_BUDGET_OPEN) {
+        return Cow::Borrowed(text);
+    }
+
+    let kept: Vec<&str> = text.split('\n').filter(|line| !is_token_budget_line(line)).collect();
+    if kept.len() == text.split('\n').count() {
+        return Cow::Borrowed(text);
+    }
+
+    Cow::Owned(kept.join("\n"))
+}
+
+fn is_token_budget_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix(TOKEN_BUDGET_OPEN) else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix(TOKEN_BUDGET_CLOSE) else {
+        return false;
+    };
+    // Guard against a nested tag so only a single self-contained line matches.
+    !inner.is_empty() && !inner.contains('<')
+}
 
 /// Strip only a leading Claude Code attribution line from system text.
 ///
@@ -154,6 +194,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
     if let Some(system) = body.get("system") {
         if let Some(text) = system.as_str() {
             let text = strip_leading_anthropic_billing_header(text);
+            let text = strip_claude_code_token_budget(text);
             if !text.is_empty() {
                 messages.push(json!({"role": "system", "content": text}));
             }
@@ -161,6 +202,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
             for msg in arr {
                 if let Some(text) = msg.get("text").and_then(|t| t.as_str()) {
                     let text = strip_leading_anthropic_billing_header(text);
+                    let text = strip_claude_code_token_budget(text);
                     if text.is_empty() {
                         continue;
                     }
@@ -780,6 +822,62 @@ mod tests {
             result["messages"][0]["content"],
             "You are a helpful assistant."
         );
+        assert_eq!(result["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn test_strip_token_budget_removes_accumulated_lines() {
+        let system = "You are Claude Code.\n\n<total_tokens>15000000 tokens left</total_tokens>\n<total_tokens>14977229 tokens left</total_tokens>";
+        assert_eq!(
+            strip_claude_code_token_budget(system),
+            "You are Claude Code.\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_token_budget_keeps_text_without_the_tag() {
+        let system = "You are Claude Code.";
+        assert!(matches!(
+            strip_claude_code_token_budget(system),
+            std::borrow::Cow::Borrowed("You are Claude Code.")
+        ));
+    }
+
+    #[test]
+    fn test_strip_token_budget_keeps_inline_mentions() {
+        // Only a line that is exactly one tag is dropped; prompt text that
+        // explains the tag has to survive.
+        let system = "Report progress as <total_tokens>N tokens left</total_tokens> inline.";
+        assert_eq!(strip_claude_code_token_budget(system), system);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_strips_token_budget_from_system_string() {
+        let input = json!({
+            "model": "claude-3",
+            "system": "You are helpful.\n<total_tokens>42 tokens left</total_tokens>",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["messages"][0]["role"], "system");
+        assert_eq!(result["messages"][0]["content"], "You are helpful.");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_strips_token_budget_from_system_array_parts() {
+        let input = json!({
+            "model": "claude-3",
+            "system": [
+                {"type": "text", "text": "You are helpful."},
+                {"type": "text", "text": "<total_tokens>42 tokens left</total_tokens>"}
+            ],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        // The budget-only part collapses to empty and is dropped entirely.
+        assert_eq!(result["messages"][0]["content"], "You are helpful.");
         assert_eq!(result["messages"][1]["role"], "user");
     }
 

@@ -1783,11 +1783,13 @@ pub fn anthropic_to_responses(
     // system → instructions (Responses API 使用 instructions 字段)
     if let Some(system) = body.get("system") {
         let instructions = if let Some(text) = system.as_str() {
-            super::transform::strip_leading_anthropic_billing_header(text).to_string()
+            let text = super::transform::strip_leading_anthropic_billing_header(text);
+            super::transform::strip_claude_code_token_budget(text).into_owned()
         } else if let Some(arr) = system.as_array() {
             arr.iter()
                 .filter_map(|msg| msg.get("text").and_then(|t| t.as_str()))
                 .map(super::transform::strip_leading_anthropic_billing_header)
+                .map(super::transform::strip_claude_code_token_budget)
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n")
